@@ -719,9 +719,14 @@ app.post('/api/update-team-participation', authenticateToken, async (req, res) =
     }
 
     // Check if a team with the same name already exists for this sport
+    // Use $elemMatch to ensure we match the same array element
     const existingTeamWithSameName = await Player.findOne({
-      'participated_in.sport': sport,
-      'participated_in.team_name': { $regex: new RegExp(`^${team_name}$`, 'i') }
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          team_name: { $regex: new RegExp(`^${team_name}$`, 'i') }
+        }
+      }
     })
 
     if (existingTeamWithSameName) {
@@ -846,9 +851,14 @@ app.post('/api/update-team-participation', authenticateToken, async (req, res) =
 
     // Check if there's already a captain in the existing team (if team already exists)
     // Find all players who are already in this team for this sport
+    // Use $elemMatch to ensure we match the same array element
     const existingTeamMembers = await Player.find({
-      'participated_in.sport': sport,
-      'participated_in.team_name': team_name
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          team_name: team_name
+        }
+      }
     }).lean()
 
     // Check if any existing team member is a captain for this sport
@@ -1500,10 +1510,15 @@ app.get('/api/teams/:sport', authenticateToken, async (req, res) => {
     }
 
     // Query directly for players who have participated in this sport with a team_name
+    // Use $elemMatch to ensure we match the same array element that has both sport and team_name
     const playersInTeams = await Player.find({
       reg_number: { $ne: 'admin' },
-      'participated_in.sport': sport,
-      'participated_in.team_name': { $exists: true, $ne: null }
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          team_name: { $exists: true, $ne: null }
+        }
+      }
     }).lean()
 
     // Group players by team name
@@ -1668,9 +1683,14 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, async (req,
     }
 
     // Get all current team members (excluding the old player)
+    // Use $elemMatch to ensure we match the same array element
     const currentTeamMembers = await Player.find({
-      'participated_in.sport': sport,
-      'participated_in.team_name': team_name,
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          team_name: team_name
+        }
+      },
       reg_number: { $ne: old_reg_number }
     }).lean()
 
@@ -1860,9 +1880,14 @@ app.delete('/api/delete-team', authenticateToken, requireAdmin, async (req, res)
     }
 
     // Find all players who are in this team
+    // Use $elemMatch to ensure we match the same array element
     const playersInTeam = await Player.find({
-      'participated_in.sport': sport,
-      'participated_in.team_name': team_name
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          team_name: team_name
+        }
+      }
     })
 
     if (playersInTeam.length === 0) {
