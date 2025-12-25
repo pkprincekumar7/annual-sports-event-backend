@@ -30,6 +30,29 @@ app.use(cors({
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
+// Registration deadline middleware - block non-GET requests after January 6th, 2026
+// Date objects use the server's local timezone
+// Parse deadline from env or use default: January 7th, 2026 00:00:00 (local timezone)
+const deadlineEnv = process.env.REGISTRATION_DEADLINE || '2026-01-07T00:00:00'
+const REGISTRATION_DEADLINE = new Date(deadlineEnv)
+
+app.use('/api', (req, res, next) => {
+  const currentDate = new Date() // Uses server's local timezone
+  
+  // If current date is after the registration deadline
+  if (currentDate >= REGISTRATION_DEADLINE) {
+    // Allow GET requests and login endpoint
+    if (req.method !== 'GET' && req.path !== '/login') {
+      return res.status(400).json({
+        success: false,
+        error: 'Registration for events closed on January 6th, 2026.'
+      })
+    }
+  }
+  
+  next()
+})
+
 // Disable caching for all API responses
 app.use('/api', (req, res, next) => {
   // Remove conditional request headers that cause 304 responses
@@ -747,6 +770,23 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
     if (fs.existsSync(playersJsonPath)) {
       const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
       players = JSON.parse(fileContent)
+    }
+
+    // Check if a team with the same name already exists for this sport
+    const existingTeamWithSameName = players.some(player => {
+      if (!player.participated_in || !Array.isArray(player.participated_in)) {
+        return false
+      }
+      return player.participated_in.some(
+        p => p.sport === sport && p.team_name && p.team_name.toLowerCase() === team_name.toLowerCase()
+      )
+    })
+
+    if (existingTeamWithSameName) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Team name "${team_name}" already exists for ${sport}. Please choose a different team name.` 
+      })
     }
 
     // Validate all players exist and have same gender and year
@@ -2206,6 +2246,13 @@ app.get('/api/export-excel', authenticateToken, requireAdmin, (req, res) => {
           } else {
             row[header] = 'NA'
           }
+          
+          // Add team name column for team sports (right after the sport column)
+          const teamHeader = `${header}_TEAM`
+          const teamParticipation = player.participated_in && 
+                                   Array.isArray(player.participated_in) && 
+                                   player.participated_in.find(p => p.sport === sport && p.team_name)
+          row[teamHeader] = teamParticipation && teamParticipation.team_name ? teamParticipation.team_name : 'NA'
         } else {
           // Individual/Cultural sports: PARTICIPANT or NA
           if (isParticipant) {
