@@ -12,6 +12,7 @@
     "cors": "^2.8.5",
     "xlsx": "^0.18.5",
     "jsonwebtoken": "^9.0.2",
-    "dotenv": "^16.0.0"
+    "dotenv": "^16.0.0",
+    "mongoose": "^8.0.0"
   }
 }

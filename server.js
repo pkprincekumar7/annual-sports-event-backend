@@ -1,14 +1,10 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import fs from 'fs'
-import path from 'path'
-import { fileURLToPath } from 'url'
 import XLSX from 'xlsx'
 import jwt from 'jsonwebtoken'
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+import connectDB from './config/database.js'
+import Player from './models/Player.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -21,12 +17,8 @@ const JWT_EXPIRES_IN = '24h' // Token expires in 24 hours
 app.set('etag', false)
 
 // Middleware
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false
-}))
+// Allow all origins, methods, and headers - most permissive configuration for Netlify
+app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
@@ -77,7 +69,7 @@ app.use('/api', (req, res, next) => {
 
 // JWT Authentication Middleware
 // Verifies JWT token and checks if user exists in the database
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization']
   const token = authHeader && authHeader.split(' ')[1] // Bearer TOKEN
 
@@ -88,7 +80,7 @@ const authenticateToken = (req, res, next) => {
     })
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
     if (err) {
       return res.status(403).json({ 
         success: false, 
@@ -98,13 +90,7 @@ const authenticateToken = (req, res, next) => {
     
     // Verify that the user exists in the players database
     try {
-      let players = []
-      if (fs.existsSync(playersJsonPath)) {
-        const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-        players = JSON.parse(fileContent)
-      }
-      
-      const userExists = players.find(p => p.reg_number === decoded.reg_number)
+      const userExists = await Player.findOne({ reg_number: decoded.reg_number })
       if (!userExists) {
         return res.status(403).json({ 
           success: false, 
@@ -140,27 +126,13 @@ const requireAdmin = (req, res, next) => {
   next()
 }
 
-// Ensure json_store directory exists
-const jsonStorePath = path.join(__dirname, 'data', 'json_store')
-const playersJsonPath = path.join(jsonStorePath, 'players.json')
-
-if (!fs.existsSync(jsonStorePath)) {
-  fs.mkdirSync(jsonStorePath, { recursive: true })
-}
-
-// Initialize players.json if it doesn't exist
-if (!fs.existsSync(playersJsonPath)) {
-  fs.writeFileSync(playersJsonPath, JSON.stringify([], null, 2))
-}
+// Connect to MongoDB
+connectDB()
 
 // API endpoint to get all players (requires authentication)
-app.get('/api/players', authenticateToken, (req, res) => {
+app.get('/api/players', authenticateToken, async (req, res) => {
   try {
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
+    const players = await Player.find({}).lean()
     res.json({ success: true, players })
   } catch (error) {
     console.error('Error reading players data:', error)
@@ -197,7 +169,7 @@ app.get('/api/sports', authenticateToken, requireAdmin, (req, res) => {
 })
 
 // API endpoint to add captain (Admin only)
-app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
+app.post('/api/add-captain', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { reg_number, sport } = req.body
 
@@ -230,16 +202,9 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player
-    const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-    if (playerIndex === -1) {
+    const player = await Player.findOne({ reg_number })
+    if (!player) {
       return res.status(404).json({ 
         success: false, 
         error: 'Player not found' 
@@ -247,12 +212,12 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Initialize captain_in array if it doesn't exist
-    if (!players[playerIndex].captain_in) {
-      players[playerIndex].captain_in = []
+    if (!player.captain_in) {
+      player.captain_in = []
     }
 
     // Check if already a captain for this sport (uniqueness check)
-    if (players[playerIndex].captain_in.includes(sport)) {
+    if (player.captain_in.includes(sport)) {
       return res.status(400).json({ 
         success: false, 
         error: `Player is already a captain for ${sport}` 
@@ -260,8 +225,8 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Check for duplicate elements in captain_in array
-    const captainInSet = new Set(players[playerIndex].captain_in)
-    if (captainInSet.size !== players[playerIndex].captain_in.length) {
+    const captainInSet = new Set(player.captain_in)
+    if (captainInSet.size !== player.captain_in.length) {
       return res.status(400).json({ 
         success: false, 
         error: 'captain_in array contains duplicate entries. Please fix the data first.' 
@@ -269,7 +234,7 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Check maximum limit: captain_in array can have maximum 10 unique entries
-    const currentCaptainCount = players[playerIndex].captain_in.length
+    const currentCaptainCount = player.captain_in.length
     if (currentCaptainCount >= 10) {
       return res.status(400).json({ 
         success: false, 
@@ -278,13 +243,13 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Initialize participated_in array if it doesn't exist
-    if (!players[playerIndex].participated_in) {
-      players[playerIndex].participated_in = []
+    if (!player.participated_in) {
+      player.participated_in = []
     }
 
     // Check for duplicate sport entries in participated_in array (uniqueness check)
-    const sportSet = new Set(players[playerIndex].participated_in.map(p => p.sport))
-    if (sportSet.size !== players[playerIndex].participated_in.length) {
+    const sportSet = new Set(player.participated_in.map(p => p.sport))
+    if (sportSet.size !== player.participated_in.length) {
       return res.status(400).json({ 
         success: false, 
         error: 'participated_in array contains duplicate sport entries. Please fix the data first.' 
@@ -292,7 +257,7 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Check maximum limit: participated_in array can have maximum 10 unique entries (based on sport name)
-    const currentParticipationsCount = players[playerIndex].participated_in.length
+    const currentParticipationsCount = player.participated_in.length
     if (currentParticipationsCount >= 10) {
       return res.status(400).json({ 
         success: false, 
@@ -301,16 +266,16 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     }
 
     // Count non-team participations (entries without team_name)
-    const nonTeamParticipations = players[playerIndex].participated_in.filter(
+    const nonTeamParticipations = player.participated_in.filter(
       p => !p.team_name
     ).length
 
     // Count team participations where sport IS in captain_in array (these count towards captain limit)
-    const captainTeamParticipations = players[playerIndex].participated_in.filter(
+    const captainTeamParticipations = player.participated_in.filter(
       p => p.team_name && 
-      players[playerIndex].captain_in && 
-      Array.isArray(players[playerIndex].captain_in) && 
-      players[playerIndex].captain_in.includes(p.sport)
+      player.captain_in && 
+      Array.isArray(player.captain_in) && 
+      player.captain_in.includes(p.sport)
     ).length
 
     // Check: (captain_in length + non-team participated_in) should not exceed 10
@@ -333,16 +298,16 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
     // Check if player is already a participant in a team for this sport
     // If they are, the team already has a captain (teams cannot be created/updated without exactly one captain)
     // So we should prevent adding this player as captain if they're not already the captain
-    const existingTeamParticipation = players[playerIndex].participated_in.find(
+    const existingTeamParticipation = player.participated_in.find(
       p => p.sport === sport && p.team_name
     )
 
     if (existingTeamParticipation) {
       // Player is already in a team for this sport
       // Check if they're already the captain for this sport
-      const isAlreadyCaptain = players[playerIndex].captain_in && 
-                               Array.isArray(players[playerIndex].captain_in) && 
-                               players[playerIndex].captain_in.includes(sport)
+      const isAlreadyCaptain = player.captain_in && 
+                               Array.isArray(player.captain_in) && 
+                               player.captain_in.includes(sport)
       
       if (!isAlreadyCaptain) {
         // Player is in a team but not the captain, which means the team already has a captain
@@ -352,17 +317,16 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
           error: `Cannot add captain role. Player is already in team "${existingTeamParticipation.team_name}" for ${sport}, which already has a captain. A team can only have one captain.` 
         })
       }
-      // If they're already the captain, the duplicate check on line 130 will catch it
+      // If they're already the captain, the duplicate check above will catch it
     }
 
     // Add sport to captain_in array
-    players[playerIndex].captain_in.push(sport)
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    player.captain_in.push(sport)
+    await player.save()
 
     // Return player data (excluding password for security)
-    const { password: _, ...playerData } = players[playerIndex]
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -380,7 +344,7 @@ app.post('/api/add-captain', authenticateToken, requireAdmin, (req, res) => {
 })
 
 // API endpoint to remove captain
-app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) => {
+app.delete('/api/remove-captain', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { reg_number, sport } = req.body
 
@@ -413,16 +377,9 @@ app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) =>
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player
-    const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-    if (playerIndex === -1) {
+    const player = await Player.findOne({ reg_number })
+    if (!player) {
       return res.status(404).json({ 
         success: false, 
         error: 'Player not found' 
@@ -430,12 +387,12 @@ app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) =>
     }
 
     // Initialize captain_in array if it doesn't exist
-    if (!players[playerIndex].captain_in) {
-      players[playerIndex].captain_in = []
+    if (!player.captain_in) {
+      player.captain_in = []
     }
 
     // Check if player is a captain for this sport
-    if (!players[playerIndex].captain_in.includes(sport)) {
+    if (!player.captain_in.includes(sport)) {
       return res.status(400).json({ 
         success: false, 
         error: `Player is not a captain for ${sport}` 
@@ -443,8 +400,8 @@ app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) =>
     }
 
     // Check if player has created a team for this sport
-    if (players[playerIndex].participated_in && Array.isArray(players[playerIndex].participated_in)) {
-      const teamParticipation = players[playerIndex].participated_in.find(
+    if (player.participated_in && Array.isArray(player.participated_in)) {
+      const teamParticipation = player.participated_in.find(
         p => p.sport === sport && p.team_name
       )
       
@@ -457,15 +414,15 @@ app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) =>
     }
 
     // Remove sport from captain_in array
-    players[playerIndex].captain_in = players[playerIndex].captain_in.filter(
+    player.captain_in = player.captain_in.filter(
       s => s !== sport
     )
 
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    await player.save()
 
     // Return player data (excluding password for security)
-    const { password: _, ...playerData } = players[playerIndex]
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -483,17 +440,13 @@ app.delete('/api/remove-captain', authenticateToken, requireAdmin, (req, res) =>
 })
 
 // API endpoint to get captains by sport
-app.get('/api/captains-by-sport', authenticateToken, requireAdmin, (req, res) => {
+app.get('/api/captains-by-sport', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
-    // Filter out admin user
-    const nonAdminPlayers = players.filter(p => p.reg_number !== 'admin')
+    // Query directly for players who are captains (have captain_in array with values)
+    const captains = await Player.find({
+      reg_number: { $ne: 'admin' },
+      captain_in: { $exists: true, $ne: [] }
+    }).lean()
 
     // Group captains by sport
     const captainsBySport = {}
@@ -514,8 +467,8 @@ app.get('/api/captains-by-sport', authenticateToken, requireAdmin, (req, res) =>
       captainsBySport[sport] = []
     })
 
-    // Find all captains
-    nonAdminPlayers.forEach(player => {
+    // Group captains by sport
+    captains.forEach(player => {
       if (player.captain_in && Array.isArray(player.captain_in)) {
         player.captain_in.forEach(sport => {
           if (teamSports.includes(sport)) {
@@ -544,7 +497,7 @@ app.get('/api/captains-by-sport', authenticateToken, requireAdmin, (req, res) =>
 })
 
 // API endpoint to validate participations before team registration
-app.post('/api/validate-participations', authenticateToken, (req, res) => {
+app.post('/api/validate-participations', authenticateToken, async (req, res) => {
   try {
     let { reg_numbers, sport } = req.body
 
@@ -562,18 +515,15 @@ app.post('/api/validate-participations', authenticateToken, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     const errors = []
+
+    // Fetch all players at once instead of one by one
+    const players = await Player.find({ reg_number: { $in: reg_numbers } }).lean()
+    const playersMap = new Map(players.map(p => [p.reg_number, p]))
 
     // Validate each player
     for (const reg_number of reg_numbers) {
-      const player = players.find(p => p.reg_number === reg_number)
+      const player = playersMap.get(reg_number)
       if (!player) {
         errors.push(`Player with reg_number ${reg_number} not found`)
         continue
@@ -658,8 +608,8 @@ app.post('/api/validate-participations', authenticateToken, (req, res) => {
 
     // Check for multiple captains in the same request
     // Note: This is a preliminary check. The actual team validation happens in update-team-participation
-    const captainsInRequest = reg_numbers
-      .map(rn => players.find(s => s.reg_number === rn))
+    const playersData = await Player.find({ reg_number: { $in: reg_numbers } }).lean()
+    const captainsInRequest = playersData
       .filter(s => s && s.captain_in && Array.isArray(s.captain_in) && s.captain_in.includes(sport))
 
     if (captainsInRequest.length > 1) {
@@ -680,8 +630,11 @@ app.post('/api/validate-participations', authenticateToken, (req, res) => {
     // Only the captain assigned to a sport can create teams for that sport
     const loggedInUserRegNumber = req.user?.reg_number
     if (loggedInUserRegNumber) {
-      // Get logged-in user from database (already verified to exist by middleware)
-      const loggedInUserInDatabase = players.find(p => p.reg_number === loggedInUserRegNumber)
+      // Get logged-in user from database (use playersMap if available, otherwise fetch)
+      let loggedInUserInDatabase = playersMap.get(loggedInUserRegNumber)
+      if (!loggedInUserInDatabase) {
+        loggedInUserInDatabase = await Player.findOne({ reg_number: loggedInUserRegNumber }).lean()
+      }
       
       // Check if logged-in user is included in the team request
       const loggedInUserInRequest = reg_numbers.includes(loggedInUserRegNumber)
@@ -690,7 +643,7 @@ app.post('/api/validate-participations', authenticateToken, (req, res) => {
       }
       
       // Check if logged-in user is a captain for this sport
-      const isLoggedInUserCaptain = loggedInUserInDatabase.captain_in && 
+      const isLoggedInUserCaptain = loggedInUserInDatabase && loggedInUserInDatabase.captain_in && 
         Array.isArray(loggedInUserInDatabase.captain_in) && 
         loggedInUserInDatabase.captain_in.includes(sport)
       
@@ -721,7 +674,7 @@ app.post('/api/validate-participations', authenticateToken, (req, res) => {
 })
 
 // API endpoint to update participated_in field for team events
-app.post('/api/update-team-participation', authenticateToken, (req, res) => {
+app.post('/api/update-team-participation', authenticateToken, async (req, res) => {
   try {
     let { reg_numbers, sport, team_name } = req.body
 
@@ -765,21 +718,10 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Check if a team with the same name already exists for this sport
-    const existingTeamWithSameName = players.some(player => {
-      if (!player.participated_in || !Array.isArray(player.participated_in)) {
-        return false
-      }
-      return player.participated_in.some(
-        p => p.sport === sport && p.team_name && p.team_name.toLowerCase() === team_name.toLowerCase()
-      )
+    const existingTeamWithSameName = await Player.findOne({
+      'participated_in.sport': sport,
+      'participated_in.team_name': { $regex: new RegExp(`^${team_name}$`, 'i') }
     })
 
     if (existingTeamWithSameName) {
@@ -789,12 +731,16 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
       })
     }
 
-    // Validate all players exist and have same gender and year
+    // Fetch all players at once instead of one by one
+    const players = await Player.find({ reg_number: { $in: reg_numbers } })
+    const playersMap = new Map(players.map(p => [p.reg_number, p]))
+
+    // Validate all players exist
     const playerData = []
     const errors = []
 
     for (const reg_number of reg_numbers) {
-      const player = players.find(p => p.reg_number === reg_number)
+      const player = playersMap.get(reg_number)
       if (!player) {
         errors.push(`Player with reg_number ${reg_number} not found`)
         continue
@@ -867,8 +813,14 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
     // Only the captain assigned to a sport can create teams for that sport
     const loggedInUserRegNumber = req.user?.reg_number
     if (loggedInUserRegNumber) {
-      // Get logged-in user from database (already verified to exist by middleware)
-      const loggedInUserInDatabase = players.find(p => p.reg_number === loggedInUserRegNumber)
+      // Get logged-in user from already fetched players (reuse playersMap)
+      const loggedInUserInDatabase = playersMap.get(loggedInUserRegNumber)
+      if (!loggedInUserInDatabase) {
+        return res.status(403).json({ 
+          success: false, 
+          error: `You must be included in the team to create it.` 
+        })
+      }
       
       // Check if logged-in user is included in the team
       const loggedInUserInTeam = playerData.find(p => p.reg_number === loggedInUserRegNumber)
@@ -894,15 +846,10 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
 
     // Check if there's already a captain in the existing team (if team already exists)
     // Find all players who are already in this team for this sport
-    const existingTeamMembers = players.filter(s => {
-      if (!s.participated_in || !Array.isArray(s.participated_in)) {
-        return false
-      }
-      const participation = s.participated_in.find(
-        p => p.sport === sport && p.team_name === team_name
-      )
-      return !!participation
-    })
+    const existingTeamMembers = await Player.find({
+      'participated_in.sport': sport,
+      'participated_in.team_name': team_name
+    }).lean()
 
     // Check if any existing team member is a captain for this sport
     const existingCaptains = existingTeamMembers.filter(s => 
@@ -923,91 +870,90 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
 
     const updatedPlayers = []
 
-    // Process each player
+    // Process each player (reuse players already fetched above)
     for (const reg_number of reg_numbers) {
-      const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-      if (playerIndex === -1) {
+      const player = playersMap.get(reg_number)
+      if (!player) {
+        // This shouldn't happen as we already validated, but check anyway
         errors.push(`Player with reg_number ${reg_number} not found`)
         continue
       }
 
       // Initialize participated_in array if it doesn't exist
-      if (!players[playerIndex].participated_in) {
-        players[playerIndex].participated_in = []
+      if (!player.participated_in) {
+        player.participated_in = []
       }
 
       // Check for duplicate sport entries in participated_in array (uniqueness check)
-      const sportSet = new Set(players[playerIndex].participated_in.map(p => p.sport))
-      if (sportSet.size !== players[playerIndex].participated_in.length) {
-        errors.push(`${players[playerIndex].full_name} (${reg_number}) has duplicate sport entries in participated_in array. Please fix the data first.`)
+      const sportSet = new Set(player.participated_in.map(p => p.sport))
+      if (sportSet.size !== player.participated_in.length) {
+        errors.push(`${player.full_name} (${reg_number}) has duplicate sport entries in participated_in array. Please fix the data first.`)
         continue
       }
 
       // Check maximum limit: participated_in array can have maximum 10 unique entries (based on sport name)
-      const currentParticipationsCount = players[playerIndex].participated_in.length
+      const currentParticipationsCount = player.participated_in.length
       if (currentParticipationsCount >= 10) {
-        errors.push(`${players[playerIndex].full_name} (${reg_number}) has reached maximum 10 participations (based on unique sport names). Please remove a participation first.`)
+        errors.push(`${player.full_name} (${reg_number}) has reached maximum 10 participations (based on unique sport names). Please remove a participation first.`)
         continue
       }
 
       // Check if already participated in this sport (for team events, player can only be in one team per sport)
-      const existingParticipation = players[playerIndex].participated_in.find(
+      const existingParticipation = player.participated_in.find(
         p => p.sport === sport
       )
 
       if (existingParticipation) {
         if (existingParticipation.team_name) {
           // Check if this player is a captain for this sport
-          const isCaptain = players[playerIndex].captain_in && 
-            Array.isArray(players[playerIndex].captain_in) && 
-            players[playerIndex].captain_in.includes(sport)
+          const isCaptain = player.captain_in && 
+            Array.isArray(player.captain_in) && 
+            player.captain_in.includes(sport)
           
           if (isCaptain) {
-            errors.push(`${players[playerIndex].full_name} (${reg_number}) is a captain and has already created a team (${existingParticipation.team_name}) for ${sport}. A captain cannot create multiple teams for the same sport.`)
+            errors.push(`${player.full_name} (${reg_number}) is a captain and has already created a team (${existingParticipation.team_name}) for ${sport}. A captain cannot create multiple teams for the same sport.`)
           } else {
-            errors.push(`${players[playerIndex].full_name} (${reg_number}) is already in a team (${existingParticipation.team_name}) for ${sport}. A player can only belong to one team per sport.`)
+            errors.push(`${player.full_name} (${reg_number}) is already in a team (${existingParticipation.team_name}) for ${sport}. A player can only belong to one team per sport.`)
           }
         } else {
-          errors.push(`${players[playerIndex].full_name} (${reg_number}) is already registered for ${sport}`)
+          errors.push(`${player.full_name} (${reg_number}) is already registered for ${sport}`)
         }
         continue
       }
 
       // Check if this player is a captain for this sport
-      const isCaptainForSport = players[playerIndex].captain_in && 
-        Array.isArray(players[playerIndex].captain_in) && 
-        players[playerIndex].captain_in.includes(sport)
+      const isCaptainForSport = player.captain_in && 
+        Array.isArray(player.captain_in) && 
+        player.captain_in.includes(sport)
       
       // Count team participations where sport IS in captain_in array (these count towards captain limit)
-      const captainTeamParticipations = players[playerIndex].participated_in.filter(
+      const captainTeamParticipations = player.participated_in.filter(
         p => p.team_name && 
-        players[playerIndex].captain_in && 
-        Array.isArray(players[playerIndex].captain_in) && 
-        players[playerIndex].captain_in.includes(p.sport)
+        player.captain_in && 
+        Array.isArray(player.captain_in) && 
+        player.captain_in.includes(p.sport)
       ).length
 
       // Get captain count
-      const captainCount = players[playerIndex].captain_in && Array.isArray(players[playerIndex].captain_in) 
-        ? players[playerIndex].captain_in.length 
+      const captainCount = player.captain_in && Array.isArray(player.captain_in) 
+        ? player.captain_in.length 
         : 0
 
       // Only check limit if this sport IS in captain_in array
       // If player is a captain for this sport, check: team participations (for captain sports) should not exceed captain_in length
       if (isCaptainForSport) {
         if (captainTeamParticipations >= captainCount) {
-          errors.push(`${players[playerIndex].full_name} (${reg_number}) has reached maximum team participations for captain sports (${captainCount}). Maximum team participations allowed for sports in captain_in array is equal to captain roles (${captainCount}).`)
+          errors.push(`${player.full_name} (${reg_number}) has reached maximum team participations for captain sports (${captainCount}). Maximum team participations allowed for sports in captain_in array is equal to captain roles (${captainCount}).`)
           continue
         }
       }
       // If player is NOT a captain for this sport, they can still join the team (no limit check)
 
       // Add sport to participated_in array with team_name
-      players[playerIndex].participated_in.push({ sport, team_name })
-      updatedPlayers.push(players[playerIndex].reg_number)
+      player.participated_in.push({ sport, team_name })
+      await player.save()
+      updatedPlayers.push(player.reg_number)
     }
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
 
     if (errors.length > 0) {
       return res.status(400).json({ 
@@ -1033,7 +979,7 @@ app.post('/api/update-team-participation', authenticateToken, (req, res) => {
 })
 
 // API endpoint to update participated_in field
-app.post('/api/update-participation', authenticateToken, (req, res) => {
+app.post('/api/update-participation', authenticateToken, async (req, res) => {
   try {
     let { reg_number, sport } = req.body
 
@@ -1063,16 +1009,9 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player
-    const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-    if (playerIndex === -1) {
+    const player = await Player.findOne({ reg_number })
+    if (!player) {
       return res.status(404).json({ 
         success: false, 
         error: 'Player not found' 
@@ -1080,13 +1019,13 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
     }
 
     // Initialize participated_in array if it doesn't exist
-    if (!players[playerIndex].participated_in) {
-      players[playerIndex].participated_in = []
+    if (!player.participated_in) {
+      player.participated_in = []
     }
 
     // Check for duplicate sport entries in participated_in array (uniqueness check)
-    const sportSet = new Set(players[playerIndex].participated_in.map(p => p.sport))
-    if (sportSet.size !== players[playerIndex].participated_in.length) {
+    const sportSet = new Set(player.participated_in.map(p => p.sport))
+    if (sportSet.size !== player.participated_in.length) {
       return res.status(400).json({ 
         success: false, 
         error: 'participated_in array contains duplicate sport entries. Please fix the data first.' 
@@ -1094,7 +1033,7 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
     }
 
     // Check maximum limit: participated_in array can have maximum 10 unique entries (based on sport name)
-    const currentParticipationsCount = players[playerIndex].participated_in.length
+    const currentParticipationsCount = player.participated_in.length
     if (currentParticipationsCount >= 10) {
       return res.status(400).json({ 
         success: false, 
@@ -1103,7 +1042,7 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
     }
 
     // Check if already participated in this sport (same sport cannot be participated twice)
-    const existingParticipation = players[playerIndex].participated_in.find(
+    const existingParticipation = player.participated_in.find(
       p => p.sport === sport
     )
 
@@ -1115,13 +1054,13 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
     }
 
     // Count non-team participations (entries without team_name)
-    const nonTeamParticipations = players[playerIndex].participated_in.filter(
+    const nonTeamParticipations = player.participated_in.filter(
       p => !p.team_name
     ).length
 
     // Get captain count
-    const captainCount = players[playerIndex].captain_in && Array.isArray(players[playerIndex].captain_in) 
-      ? players[playerIndex].captain_in.length 
+    const captainCount = player.captain_in && Array.isArray(player.captain_in) 
+      ? player.captain_in.length 
       : 0
     
     // Check maximum limit: (captain_in length + non-team participated_in) should not exceed 10
@@ -1141,13 +1080,12 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
     }
 
     // Add sport to participated_in array (without team_name for individual events)
-    players[playerIndex].participated_in.push({ sport })
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    player.participated_in.push({ sport })
+    await player.save()
 
     // Return player data (excluding password for security)
-    const { password: _, ...playerData } = players[playerIndex]
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -1165,7 +1103,7 @@ app.post('/api/update-participation', authenticateToken, (req, res) => {
 })
 
 // API endpoint for login
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   try {
     let { reg_number, password } = req.body
 
@@ -1181,15 +1119,8 @@ app.post('/api/login', (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player with matching reg_number
-    const player = players.find(p => p.reg_number === reg_number)
+    const player = await Player.findOne({ reg_number })
 
     if (!player) {
       return res.status(401).json({ 
@@ -1213,6 +1144,7 @@ app.post('/api/login', (req, res) => {
     if (!player.captain_in) {
       player.captain_in = []
     }
+    await player.save()
 
     // Generate JWT token
     const tokenPayload = {
@@ -1224,7 +1156,8 @@ app.post('/api/login', (req, res) => {
     const token = jwt.sign(tokenPayload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN })
 
     // Return player data (excluding password for security) and token
-    const { password: _, ...playerData } = player
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -1243,7 +1176,7 @@ app.post('/api/login', (req, res) => {
 })
 
 // API endpoint to save player data
-app.post('/api/save-player', (req, res) => {
+app.post('/api/save-player', async (req, res) => {
   try {
     let { reg_number, full_name, gender, department_branch, year, mobile_number, email_id, password } = req.body
 
@@ -1310,16 +1243,9 @@ app.post('/api/save-player', (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Check if player with same reg_number already exists
-    const existingIndex = players.findIndex(s => s.reg_number === reg_number)
-    if (existingIndex !== -1) {
+    const existingPlayer = await Player.findOne({ reg_number })
+    if (existingPlayer) {
       // Reject duplicate registration
       return res.status(409).json({ 
         success: false, 
@@ -1329,7 +1255,7 @@ app.post('/api/save-player', (req, res) => {
     }
 
     // Create new player object (use trimmed values)
-    const newPlayer = {
+    const newPlayer = new Player({
       reg_number,
       full_name,
       gender,
@@ -1340,13 +1266,10 @@ app.post('/api/save-player', (req, res) => {
       password,
       participated_in: [],
       captain_in: [],
-    }
+    })
     
-    // Add to array
-    players.push(newPlayer)
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    // Save to database
+    await newPlayer.save()
 
     res.json({ 
       success: true, 
@@ -1364,7 +1287,7 @@ app.post('/api/save-player', (req, res) => {
 })
 
 // API endpoint to save multiple players (for team events)
-app.post('/api/save-players', (req, res) => {
+app.post('/api/save-players', async (req, res) => {
   try {
     let { players } = req.body
 
@@ -1446,13 +1369,6 @@ app.post('/api/save-players', (req, res) => {
       }
     }
 
-    // Read existing data
-    let existingPlayers = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      existingPlayers = JSON.parse(fileContent)
-    }
-
     // Check for duplicates within the incoming array
     const regNumbers = new Set()
     for (const player of players) {
@@ -1467,22 +1383,26 @@ app.post('/api/save-players', (req, res) => {
     }
 
     // Check for duplicates against existing players
-    const existingRegNumbers = new Set(existingPlayers.map(s => s.reg_number))
-    for (const player of players) {
-      if (existingRegNumbers.has(player.reg_number)) {
-        return res.status(409).json({ 
-          success: false, 
-          error: `Registration number already exists: ${player.reg_number}`,
-          code: 'DUPLICATE_REG_NUMBER'
-        })
-      }
+    const incomingRegNumbers = players.map(p => p.reg_number)
+    const existingPlayers = await Player.find({ reg_number: { $in: incomingRegNumbers } })
+    if (existingPlayers.length > 0) {
+      const existingRegNumbers = existingPlayers.map(p => p.reg_number)
+      return res.status(409).json({ 
+        success: false, 
+        error: `Registration number(s) already exist: ${existingRegNumbers.join(', ')}`,
+        code: 'DUPLICATE_REG_NUMBER'
+      })
     }
 
-    // Add new players
-    existingPlayers.push(...players)
+    // Create player documents
+    const playerDocuments = players.map(player => ({
+      ...player,
+      participated_in: [],
+      captain_in: []
+    }))
 
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(existingPlayers, null, 2))
+    // Add new players to database
+    await Player.insertMany(playerDocuments)
 
     res.json({ 
       success: true, 
@@ -1500,7 +1420,7 @@ app.post('/api/save-players', (req, res) => {
 })
 
 // API endpoint to remove participation for non-team events
-app.delete('/api/remove-participation', authenticateToken, requireAdmin, (req, res) => {
+app.delete('/api/remove-participation', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { reg_number, sport } = req.body
 
@@ -1516,16 +1436,9 @@ app.delete('/api/remove-participation', authenticateToken, requireAdmin, (req, r
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player
-    const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-    if (playerIndex === -1) {
+    const player = await Player.findOne({ reg_number })
+    if (!player) {
       return res.status(404).json({ 
         success: false, 
         error: 'Player not found' 
@@ -1533,12 +1446,12 @@ app.delete('/api/remove-participation', authenticateToken, requireAdmin, (req, r
     }
 
     // Initialize participated_in array if it doesn't exist
-    if (!players[playerIndex].participated_in) {
-      players[playerIndex].participated_in = []
+    if (!player.participated_in) {
+      player.participated_in = []
     }
 
     // Find the participation entry for this sport (non-team event - no team_name)
-    const participationIndex = players[playerIndex].participated_in.findIndex(
+    const participationIndex = player.participated_in.findIndex(
       p => p.sport === sport && !p.team_name
     )
 
@@ -1550,13 +1463,12 @@ app.delete('/api/remove-participation', authenticateToken, requireAdmin, (req, r
     }
 
     // Remove the participation entry
-    players[playerIndex].participated_in.splice(participationIndex, 1)
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    player.participated_in.splice(participationIndex, 1)
+    await player.save()
 
     // Return player data (excluding password for security)
-    const { password: _, ...playerData } = players[playerIndex]
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -1574,7 +1486,7 @@ app.delete('/api/remove-participation', authenticateToken, requireAdmin, (req, r
 })
 
 // API endpoint to get all teams for a specific sport
-app.get('/api/teams/:sport', authenticateToken, (req, res) => {
+app.get('/api/teams/:sport', authenticateToken, async (req, res) => {
   try {
     // Decode the sport name from URL parameter
     let sport = decodeURIComponent(req.params.sport)
@@ -1587,26 +1499,18 @@ app.get('/api/teams/:sport', authenticateToken, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
+    // Query directly for players who have participated in this sport with a team_name
+    const playersInTeams = await Player.find({
+      reg_number: { $ne: 'admin' },
+      'participated_in.sport': sport,
+      'participated_in.team_name': { $exists: true, $ne: null }
+    }).lean()
 
-    // Filter out admin user
-    const nonAdminPlayers = players.filter(p => p.reg_number !== 'admin')
-
-    // Group players by team name for the specified sport
+    // Group players by team name
     const teamsMap = new Map()
 
-    for (const player of nonAdminPlayers) {
-      if (!player.participated_in || !Array.isArray(player.participated_in)) {
-        continue
-      }
-
+    for (const player of playersInTeams) {
       // Find participation in this sport with a team_name
-      // Use exact match for sport name
       const participation = player.participated_in.find(
         p => p.sport === sport && p.team_name
       )
@@ -1654,7 +1558,7 @@ app.get('/api/teams/:sport', authenticateToken, (req, res) => {
 })
 
 // API endpoint to get all participants for a specific sport (non-team events)
-app.get('/api/participants/:sport', authenticateToken, requireAdmin, (req, res) => {
+app.get('/api/participants/:sport', authenticateToken, requireAdmin, async (req, res) => {
   try {
     // Decode the sport name from URL parameter
     let sport = decodeURIComponent(req.params.sport)
@@ -1667,35 +1571,26 @@ app.get('/api/participants/:sport', authenticateToken, requireAdmin, (req, res) 
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
-    // Filter out admin user
-    const nonAdminPlayers = players.filter(p => p.reg_number !== 'admin')
-
-    // Find all players who have participated in this sport (non-team events don't have team_name)
-    const participants = []
-
-    for (const player of nonAdminPlayers) {
-      if (!player.participated_in || !Array.isArray(player.participated_in)) {
-        continue
+    // Query directly for players who have participated in this sport without team_name
+    // Use $elemMatch to match array elements where sport matches and team_name is null/doesn't exist
+    const players = await Player.find({
+      reg_number: { $ne: 'admin' },
+      participated_in: {
+        $elemMatch: {
+          sport: sport,
+          $or: [
+            { team_name: { $exists: false } },
+            { team_name: null }
+          ]
+        }
       }
+    }).lean()
 
-      // Find participation in this sport without team_name (individual/cultural events)
-      const participation = player.participated_in.find(
-        p => p.sport === sport && !p.team_name
-      )
-
-      if (participation) {
-        // Add player to participants list (excluding password)
-        const { password: _, ...playerData } = player
-        participants.push(playerData)
-      }
-    }
+    // Map to participants (excluding password)
+    const participants = players.map(player => {
+      const { password: _, ...playerData } = player
+      return playerData
+    })
 
     // Sort participants by name
     participants.sort((a, b) => a.full_name.localeCompare(b.full_name))
@@ -1717,7 +1612,7 @@ app.get('/api/participants/:sport', authenticateToken, requireAdmin, (req, res) 
 })
 
 // API endpoint to update/replace a player in a team
-app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) => {
+app.post('/api/update-team-player', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { team_name, sport, old_reg_number, new_reg_number } = req.body
 
@@ -1735,16 +1630,9 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find old player
-    const oldPlayerIndex = players.findIndex(s => s.reg_number === old_reg_number)
-    if (oldPlayerIndex === -1) {
+    const oldPlayer = await Player.findOne({ reg_number: old_reg_number })
+    if (!oldPlayer) {
       return res.status(404).json({ 
         success: false, 
         error: 'Old player not found' 
@@ -1752,8 +1640,8 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
     }
 
     // Find new player
-    const newPlayerIndex = players.findIndex(s => s.reg_number === new_reg_number)
-    if (newPlayerIndex === -1) {
+    const newPlayer = await Player.findOne({ reg_number: new_reg_number })
+    if (!newPlayer) {
       return res.status(404).json({ 
         success: false, 
         error: 'New player not found' 
@@ -1761,7 +1649,6 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
     }
 
     // Check if old player is in the team
-    const oldPlayer = players[oldPlayerIndex]
     if (!oldPlayer.participated_in || !Array.isArray(oldPlayer.participated_in)) {
       return res.status(400).json({ 
         success: false, 
@@ -1781,18 +1668,13 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
     }
 
     // Get all current team members (excluding the old player)
-    const currentTeamMembers = players.filter(s => {
-      if (!s.participated_in || !Array.isArray(s.participated_in)) {
-        return false
-      }
-      const participation = s.participated_in.find(
-        p => p.sport === sport && p.team_name === team_name
-      )
-      return !!participation && s.reg_number !== old_reg_number
-    })
+    const currentTeamMembers = await Player.find({
+      'participated_in.sport': sport,
+      'participated_in.team_name': team_name,
+      reg_number: { $ne: old_reg_number }
+    }).lean()
 
     // Validate new player
-    const newPlayer = players[newPlayerIndex]
 
     // Check if new player is already in this team
     if (currentTeamMembers.some(m => m.reg_number === new_reg_number)) {
@@ -1938,12 +1820,11 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
       newPlayer.participated_in = []
     }
     newPlayer.participated_in.push({ sport, team_name })
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    await newPlayer.save()
 
     // Return updated data
-    const { password: _, ...newPlayerData } = newPlayer
+    const newPlayerData = newPlayer.toObject()
+    delete newPlayerData.password
 
     res.json({ 
       success: true, 
@@ -1962,7 +1843,7 @@ app.post('/api/update-team-player', authenticateToken, requireAdmin, (req, res) 
 })
 
 // API endpoint to delete a team (remove all players' associations to the team)
-app.delete('/api/delete-team', authenticateToken, requireAdmin, (req, res) => {
+app.delete('/api/delete-team', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { team_name, sport } = req.body
 
@@ -1978,19 +1859,24 @@ app.delete('/api/delete-team', authenticateToken, requireAdmin, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
+    // Find all players who are in this team
+    const playersInTeam = await Player.find({
+      'participated_in.sport': sport,
+      'participated_in.team_name': team_name
+    })
+
+    if (playersInTeam.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Team not found or has no members' 
+      })
     }
 
-    // Find all players who are in this team
     const teamMembers = []
     let deletedCount = 0
 
-    for (let i = 0; i < players.length; i++) {
-      const player = players[i]
+    // Remove participation from each player
+    for (const player of playersInTeam) {
       if (!player.participated_in || !Array.isArray(player.participated_in)) {
         continue
       }
@@ -2003,6 +1889,7 @@ app.delete('/api/delete-team', authenticateToken, requireAdmin, (req, res) => {
       if (participationIndex !== -1) {
         // Remove this participation
         player.participated_in.splice(participationIndex, 1)
+        await player.save()
         teamMembers.push({
           reg_number: player.reg_number,
           full_name: player.full_name
@@ -2010,16 +1897,6 @@ app.delete('/api/delete-team', authenticateToken, requireAdmin, (req, res) => {
         deletedCount++
       }
     }
-
-    if (deletedCount === 0) {
-      return res.status(404).json({ 
-        success: false, 
-        error: 'Team not found or has no members' 
-      })
-    }
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
 
     res.json({ 
       success: true, 
@@ -2038,7 +1915,7 @@ app.delete('/api/delete-team', authenticateToken, requireAdmin, (req, res) => {
 })
 
 // API endpoint to update player data
-app.put('/api/update-player', authenticateToken, requireAdmin, (req, res) => {
+app.put('/api/update-player', authenticateToken, requireAdmin, async (req, res) => {
   try {
     let { reg_number, full_name, gender, department_branch, year, mobile_number, email_id } = req.body
 
@@ -2104,47 +1981,29 @@ app.put('/api/update-player', authenticateToken, requireAdmin, (req, res) => {
       })
     }
 
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
     // Find player with matching reg_number
-    const playerIndex = players.findIndex(p => p.reg_number === reg_number)
-    if (playerIndex === -1) {
+    const player = await Player.findOne({ reg_number })
+    if (!player) {
       return res.status(404).json({ 
         success: false, 
         error: 'Player not found' 
       })
     }
 
-    // Preserve existing password, participated_in, and captain_in
-    const existingPlayer = players[playerIndex]
-    const updatedPlayer = {
-      ...existingPlayer,
-      reg_number, // Keep original reg_number (cannot be changed)
-      full_name,
-      gender,
-      department_branch,
-      year,
-      mobile_number,
-      email_id,
-      // Preserve password, participated_in, and captain_in
-      password: existingPlayer.password,
-      participated_in: existingPlayer.participated_in || [],
-      captain_in: existingPlayer.captain_in || [],
-    }
+    // Update player fields (preserve password, participated_in, and captain_in)
+    player.full_name = full_name
+    player.gender = gender
+    player.department_branch = department_branch
+    player.year = year
+    player.mobile_number = mobile_number
+    player.email_id = email_id
+    // password, participated_in, and captain_in are preserved automatically
 
-    // Update player in array
-    players[playerIndex] = updatedPlayer
-
-    // Write back to file
-    fs.writeFileSync(playersJsonPath, JSON.stringify(players, null, 2))
+    await player.save()
 
     // Return updated player (excluding password)
-    const { password: _, ...playerData } = updatedPlayer
+    const playerData = player.toObject()
+    delete playerData.password
 
     res.json({ 
       success: true, 
@@ -2162,17 +2021,10 @@ app.put('/api/update-player', authenticateToken, requireAdmin, (req, res) => {
 })
 
 // API endpoint to export players data to Excel
-app.get('/api/export-excel', authenticateToken, requireAdmin, (req, res) => {
+app.get('/api/export-excel', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // Read existing data
-    let players = []
-    if (fs.existsSync(playersJsonPath)) {
-      const fileContent = fs.readFileSync(playersJsonPath, 'utf8')
-      players = JSON.parse(fileContent)
-    }
-
-    // Filter out admin user
-    const nonAdminPlayers = players.filter(p => p.reg_number !== 'admin')
+    // Read existing data and filter out admin user
+    const nonAdminPlayers = await Player.find({ reg_number: { $ne: 'admin' } }).lean()
 
     // Define all sports in order with exact column headers as specified
     const sportColumns = [
@@ -2296,6 +2148,6 @@ app.get('/api/export-excel', authenticateToken, requireAdmin, (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`)
-  console.log(`Players JSON will be saved to: ${playersJsonPath}`)
+  console.log(`MongoDB connected. Player data stored in MongoDB.`)
 })
 
