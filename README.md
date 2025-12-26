@@ -203,22 +203,44 @@ sudo journalctl -u annual-sports-backend -n 50
 ### 8. Configure Firewall (if needed)
 
 ```bash
-# Allow port 3001 (or your configured port)
+# Allow port 3001 (or your configured port) - only needed if not using Nginx
 sudo ufw allow 3001/tcp
 
+# If using Nginx with HTTPS, allow these ports instead:
+sudo ufw allow 80/tcp   # HTTP (for Let's Encrypt verification)
+sudo ufw allow 443/tcp  # HTTPS
+sudo ufw allow 'Nginx Full'
+
 # Or if using iptables
-sudo iptables -A INPUT -p tcp --dport 3001 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 3001 -j ACCEPT  # Only if not using Nginx
+sudo iptables -A INPUT -p tcp --dport 80 -j ACCEPT   # HTTP
+sudo iptables -A INPUT -p tcp --dport 443 -j ACCEPT  # HTTPS
 ```
 
-### 9. Setup Reverse Proxy (Optional but Recommended)
+**Note:** If you're using Nginx as a reverse proxy, you typically don't need to expose port 3001 publicly. Nginx will handle external traffic on ports 80/443 and forward to your Node.js app on localhost:3001.
 
-If you want to use a domain name or port 80/443, set up Nginx as a reverse proxy:
+### 9. Setup Reverse Proxy with HTTPS (Required for HTTPS Frontend)
+
+**IMPORTANT:** If your frontend is hosted on HTTPS, your backend MUST also use HTTPS to avoid mixed content errors.
+
+#### Step 1: Install Nginx
 
 ```bash
 # Install Nginx
 sudo apt-get update
 sudo apt-get install nginx
+```
 
+#### Step 2: Install Certbot (Let's Encrypt SSL)
+
+```bash
+# Install Certbot
+sudo apt-get install certbot python3-certbot-nginx
+```
+
+#### Step 3: Create Initial Nginx Configuration (HTTP)
+
+```bash
 # Create Nginx configuration
 sudo nano /etc/nginx/sites-available/annual-sports-backend
 ```
@@ -228,7 +250,7 @@ Add the following configuration:
 ```nginx
 server {
     listen 80;
-    server_name your-domain.com;  # Replace with your domain or IP
+    server_name your-domain.com;  # Replace with your actual domain name
 
     location / {
         proxy_pass http://localhost:3001;
@@ -250,6 +272,104 @@ Enable the site:
 sudo ln -s /etc/nginx/sites-available/annual-sports-backend /etc/nginx/sites-enabled/
 sudo nginx -t  # Test configuration
 sudo systemctl restart nginx
+```
+
+#### Step 4: Obtain SSL Certificate
+
+```bash
+# Get SSL certificate (replace with your domain)
+sudo certbot --nginx -d your-domain.com
+
+# Or if you have multiple domains/subdomains:
+sudo certbot --nginx -d your-domain.com -d www.your-domain.com
+```
+
+Certbot will automatically:
+- Obtain SSL certificate from Let's Encrypt
+- Update your Nginx configuration to use HTTPS
+- Set up automatic certificate renewal
+
+#### Step 5: Verify HTTPS Configuration
+
+After Certbot runs, your Nginx config will be updated to include HTTPS. It should look like:
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+    return 301 https://$server_name$request_uri;  # Redirect HTTP to HTTPS
+}
+
+server {
+    listen 443 ssl http2;
+    server_name your-domain.com;
+
+    ssl_certificate /etc/letsencrypt/live/your-domain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/your-domain.com/privkey.pem;
+    
+    # SSL configuration (added by Certbot)
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+#### Step 6: Update Firewall
+
+```bash
+# Allow HTTPS (port 443)
+sudo ufw allow 443/tcp
+sudo ufw allow 'Nginx Full'
+```
+
+#### Step 7: Test SSL Certificate Auto-Renewal
+
+```bash
+# Test renewal (dry run)
+sudo certbot renew --dry-run
+```
+
+Certbot automatically renews certificates. You can verify the renewal timer:
+
+```bash
+sudo systemctl status certbot.timer
+```
+
+#### Alternative: If You Don't Have a Domain Name
+
+If you're using an IP address instead of a domain:
+
+1. **Option A: Use a self-signed certificate** (not recommended for production, browsers will show warnings):
+   ```bash
+   # Generate self-signed certificate
+   sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+     -keyout /etc/nginx/ssl/nginx-selfsigned.key \
+     -out /etc/nginx/ssl/nginx-selfsigned.crt
+   ```
+
+2. **Option B: Use a free domain** (recommended):
+   - Get a free domain from services like Freenom, No-IP, or DuckDNS
+   - Point it to your server's IP address
+   - Follow the Certbot steps above
+
+#### Update Frontend API URL
+
+After setting up HTTPS, update your frontend to use the HTTPS backend URL:
+
+```javascript
+// Example: Update your API base URL
+const API_BASE_URL = 'https://your-domain.com';
 ```
 
 ## Project Structure
@@ -359,6 +479,39 @@ The server is configured to allow all origins (`origin: '*'`). Allowed methods:
 - OPTIONS
 
 ## Troubleshooting
+
+### HTTPS/Mixed Content Issues
+
+**Problem:** Frontend on HTTPS cannot connect to backend on HTTP (Mixed Content Error)
+
+**Solution:** Set up HTTPS for your backend using Nginx and Let's Encrypt (see Step 9 above).
+
+**Quick Checklist:**
+1. ✅ Backend has a domain name (not just IP address)
+2. ✅ Nginx is installed and configured
+3. ✅ SSL certificate is obtained (via Certbot)
+4. ✅ Port 443 (HTTPS) is open in firewall
+5. ✅ Frontend API URL is updated to use `https://` instead of `http://`
+
+**Common Issues:**
+
+- **"Mixed Content" error in browser console:**
+  - Ensure backend URL in frontend uses `https://` protocol
+  - Check that SSL certificate is valid and not expired
+
+- **Certbot fails to obtain certificate:**
+  - Ensure domain DNS points to your server IP
+  - Ensure port 80 is open (needed for Let's Encrypt verification)
+  - Check firewall rules: `sudo ufw status`
+
+- **Nginx 502 Bad Gateway:**
+  - Check if Node.js app is running: `sudo systemctl status annual-sports-backend`
+  - Verify proxy_pass points to correct port: `http://localhost:3001`
+  - Check Nginx error logs: `sudo tail -f /var/log/nginx/error.log`
+
+- **SSL certificate expired:**
+  - Certbot should auto-renew, but you can manually renew: `sudo certbot renew`
+  - Check renewal status: `sudo certbot certificates`
 
 ### Service won't start
 - Check logs: `sudo journalctl -u annual-sports-backend -n 50`
